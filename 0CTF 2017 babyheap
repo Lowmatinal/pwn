@@ -1,23 +1,16 @@
 
 脑子是不够用了 记下来好了
-
 在CTFwiki 和 丁神的博客看到了两种leak的方法 都很巧妙了
 
-记一下
-
 丁神的方法
-
 https://blog.csdn.net/qq_29343201/article/details/66476135
-
 利用堆溢出修改chunk_size，造成chunk overlap，dump的时候就可以把后面一个chunk的fd和bk显示出来了
 
-
 分配chunk 0（size = 0x60）分配chunk1（0x40）
-
-
 +---------------+---------------+------------------+
 |               |               |                  |
 |     chunk 0   |    chunk 1    |      chunk 1     |
 |      0x60     |   head(0x10)  |     content 0x40 |
 |               |               |                  |
 +---------------+---------------+------------------+
+
