@@ -1,0 +1,131 @@
+checksec看一下，保护全开
+Arch:     amd64-64-little
+RELRO:    Full RELRO
+Stack:    Canary found
+NX:       NX enabled
+PIE:      PIE enabled
+
+运行后看一下，有五个功能，猜测堆题
+1.Allocate
+2.Delete          
+3.Enc
+4.Show
+5.Exit
+
+IDA看一下功能
+
+==============================================================================================================
+
+Allocate功能中 有一个对chunksize的限制 满足后才能够创建一个message chunk
+if ( size > 0x100 && (unsigned int)size <= 0xFFF )
+后面的size神奇的多出了一个unsigned int
+在GDB里调试一下 如果输入size为0xffff00000120的话 第二次比较用的是eax里的值，eax=0x120 于是绕过了最大size为0xfff的限制
+
+ RAX  0xffff00000120
+───────────────────────────────────[ DISASM ]───────────────────────────────────
+   0x556de973bee3    call   0x556de973bdc7
+ 
+   0x556de973bee8    mov    qword ptr [rbp - 0x20], rax
+   0x556de973beec    cmp    qword ptr [rbp - 0x20], 0x100    第一次比较
+   0x556de973bef4    jbe    0x556de973c009
+ 
+   0x556de973befa    mov    rax, qword ptr [rbp - 0x20]      
+ ► 0x556de973befe    cmp    eax, 0xfff                       第二次比较
+   0x556de973bf03    ja     0x556de973c009
+ 
+   0x556de973bf09    mov    edi, 0x28
+   0x556de973bf0e    call   0x556de973ba18
+ 
+   0x556de973bf13    mov    rcx, rax
+   0x556de973bf16    lea    rax, [rip + 0x201143]
+───────────────────────────────────[ STACK ]────────────────────────────────────
+00:0000│ rsp  0x7ffd0b131130 ◂— 0x200000000
+01:0008│      0x7ffd0b131138 ◂— 0x556d00000002
+02:0010│      0x7ffd0b131140 ◂— 0xffff00000120
+03:0018│      0x7ffd0b131148 ◂— 0xf19fe7329d013600
+04:0020│      0x7ffd0b131150 —▸ 0x556deb482580 ◂— 0x68732f6e69622f /* '/bin/sh' */
+05:0028│      0x7ffd0b131158 ◂— 0x0
+06:0030│ rbp  0x7ffd0b131160 —▸ 0x7ffd0b131180 —▸ 0x556de973c4e0 ◂— push   r15
+07:0038│      0x7ffd0b131168 —▸ 0x556de973c496 ◂— jmp    0x556de973c4d3
+
+pwndbg> p $eax
+$1 = 288
+
+==============================================================================================================
+
+再看看一下delete功能
+free(*((void **)qword_202060[v1] + 3));
+*((_QWORD *)qword_202060[v1] + 3) = 0LL;
+在free之后并没有将message chunk中的内容清空 重新分配一个chunk之后即可泄露出libc的基址  use-after-free
+
+这是一个正常分配后的堆
+0x556deb482000:	0x0000000000000000	0x0000000000000031
+0x556deb482010:	0xe42018d217a1a13b	0x64a326930214cb67
+0x556deb482020:	0x2320202000000000	0x0000556deb482040 <-------*((_QWORD *)qword_202060[v1] + 3) 这个指针会指向message chunk
+0x556deb482030:	0x0000000000000500	0x0000000000000511 
+0x556deb482040:	0x2323232320202023	0x2320202020232020 <-------message chunk
+
+这是free之后的堆
+0x55bb46fff000:	0x0000000000000000	0x0000000000000031
+0x55bb46fff010:	0x0000000000000000	0x8d130cac44cd090b
+0x55bb46fff020:	0x2320202000000000	0x0000000000000000 <-------*((_QWORD *)qword_202060[v1] + 3)
+0x55bb46fff030:	0x0000000000000500	0x0000000000000511
+0x55bb46fff040:	0x00007fea43ca8b78	0x00007fea43ca8b78 <-------main_arena
+
+==============================================================================================================
+
+
+enc功能中 只要能够将offset设置的足够大 就能够造成任意地址写
+offset的最大值又取决于message chunksize
+if ( qword_202060[v3] )
+  {
+    puts("Offset of msg: ");
+    v4 = sub_DC7();                                   <---------v4=offset
+    if ( *((_QWORD *)qword_202060[v3] + 4) > v4 )     <--------- *((_QWORD *)qword_202060[v3] + 4)为message chunksize
+    {
+      puts("Len of msg: ");
+      v0 = *((_QWORD *)qword_202060[v3] + 4) - v4;
+      v5 = sub_DC7();
+      if ( v5 <= v0 )
+      {
+        puts("Msg: ");
+        sub_D2D((_BYTE *)(*((_QWORD *)qword_202060[v3] + 3) + v4), v5);
+        v6 = *((_QWORD *)qword_202060[v3] + 3) + v4;
+        for ( i = 0LL; i < v5; ++i )
+          *(_BYTE *)(v6 + i) ^= *((_BYTE *)qword_202060[v3] + (i & 0xF));  <-------------与key异或后，任意地址写
+      }
+    }
+
+==============================================================================================================
+
+于是我们现在就有了泄露libc以及任意地址写
+将free_hook改为system，执行/bin/sh就OK了
+
+==============================================================================================================
+
+Allocate一个0xffff00000120大小的message后，原本应该指向message chunk的指针为零，所以只需要将offset设置为free_hook的地址，就可对free_hook进行修改
+v0 = qword_202060[v2];
+v0[3] = malloc(size);  当size过大，malloc将会返回NULL。所以原本应该指向message chunk的指针为零。
+
+分配0xffff00000120大小的message后的堆
+0x563dbae1c6c0:	0x0000000000000000	0x0000000000000031
+0x563dbae1c6d0:	0x9682f86658ef2326	0x8b09713ef32526f7
+0x563dbae1c6e0:	0x0000000000000000	0x0000000000000000 <-------*((_QWORD *)qword_202060[v1] + 3) 这个指针会指向message chunk
+0x563dbae1c6f0:	0x0000ffff00000120	0x0000000000020911
+0x563dbae1c700:	0x0000000000000000	0x0000000000000000
+
+
+通过enc功能设置free_hook为system，再通过enc功能设置一个message chunk为/bin/sh
+最后free这个message chunk 即可拿到shell
+
+
+
+
+
+
+
+
+
+
+
+
